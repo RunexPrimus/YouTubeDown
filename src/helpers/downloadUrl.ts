@@ -37,7 +37,7 @@ export default async function downloadUrl(
       noPlaylist: true,
       format: downloadJob.audio
         ? 'bestaudio[filesize<=2G]/bestaudio[filesize_approx<=2G]/[filesize<=2G]/[filesize_approx<=2G]'
-        : '[filesize<=2G][ext=mp4]/[filesize_approx<=2G][ext=mp4]/[filesize<=2G]/[filesize_approx<=2G]',
+        : '[filesize<=2G][ext=mp4]/[filesize_approx<=2G][ext=mp4]/[filesize<=2G]/[filesize_approx<=2G]/best',
       maxFilesize: '2048m',
       noCallHome: true,
       noProgress: true,
@@ -94,7 +94,8 @@ export default async function downloadUrl(
         if (error.message.includes('Unsupported URL')) {
           downloadJob.status = DownloadJobStatus.unsupportedUrl
         } else if (
-          error.message.includes('Requested format is not available')
+          error.message.includes('Requested format is not available') ||
+          error.message.includes('File is larger than max-filesize')
         ) {
           downloadJob.status = DownloadJobStatus.noSuitableVideoSize
         } else {
