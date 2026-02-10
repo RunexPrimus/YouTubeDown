@@ -5,3 +5,4 @@ aiohttp
 aiofiles
 lxml
 aiogram
+dotenv
