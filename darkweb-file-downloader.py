@@ -431,7 +431,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
     max_mb = int(args.max_mb or os.getenv("MAX_MB", "150"))
     allow_ext = parse_allow_ext(args.allow_ext or os.getenv(
         "ALLOWED_EXT",
-        "pdf,txt,jpg,jpeg,png,zip,mp4,mkv,avi,webm,mov"
+        "pdf,.php,jpg,jpeg,png,zip,mp4,mkv,avi,webm,mov"
     ))
     max_files = int(args.max_files or os.getenv("MAX_FILES", "300"))
     max_depth = int(args.max_depth or os.getenv("MAX_DEPTH", "2"))
