@@ -1,6 +1,9 @@
-aiogram==3.4.1
-aiohttp
-aiofiles
+aiogram==3.24.0
+pydantic>=2.8.0,<3
+python-dotenv>=1.0.0
+
+aiohttp>=3.10.0
+aiofiles>=24.1.0
 requests
 beautifulsoup4
 lxml
