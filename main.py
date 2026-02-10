@@ -19,7 +19,7 @@ if not BOT_TOKEN:
 
 # --- Safety limits ---
 MAX_MB = 150
-ALLOWED_EXT = {"pdf", "mkv", "jpg", "jpeg", "png", "zip"}  # change as you like
+ALLOWED_EXT = {"pdf", "mkv", "jpg", "jpeg", "png", "zip"}  # change as you lik
 ONION_RE = re.compile(r"^https?://[a-z2-7]{16,56}\.onion(/.*)?$", re.I)
 
 SCRIPT_PATH = Path("./darkweb-file-downloader.py")  # repo file name
