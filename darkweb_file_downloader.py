@@ -56,7 +56,7 @@ class Settings:
 
     def __post_init__(self):
         if self.allow_ext is None:
-            self.allow_ext = {"pdf", "txt", "jpg", "jpeg", "png", "zip"}
+            self.allow_ext = {"mp4", "mkv", "jpg", "jpeg", "png", "zip"}
 
 
 @dataclass
