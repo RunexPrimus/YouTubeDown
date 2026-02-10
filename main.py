@@ -1,205 +1,258 @@
 import asyncio
 import os
 import re
-import shlex
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
-from dotenv import load_dotenv
 
-load_dotenv()
+import aiohttp
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+try:
+    from aiohttp_socks import ProxyConnector  # pip install aiohttp-socks
+except Exception:
+    ProxyConnector = None  # fallback if not installed
+
+
+# =======================
+# CONFIG
+# =======================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing in .env")
+    raise RuntimeError("BOT_TOKEN env missing")
 
-# --- Safety limits ---
-MAX_MB = 150
-ALLOWED_EXT = {"pdf", "mkv", "jpg", "jpeg", "png", "zip"}  # change as you lik
-ONION_RE = re.compile(r"^https?://[a-z2-7]{16,56}\.onion(/.*)?$", re.I)
+# If you run Dockerfile with tor inside container -> default works:
+# socks5h://127.0.0.1:9050
+# If you have remote tor node (VPS) -> set TOR_PROXY=socks5h://<ip>:9050
+TOR_PROXY = os.getenv("TOR_PROXY", "socks5h://127.0.0.1:9050").strip()
 
-SCRIPT_PATH = Path("./darkweb-file-downloader.py")  # repo file name
-TORSOCKS_BIN = "torsocks"
+# Downloader script path (put in repo root)
+DOWNLOADER_SCRIPT = Path(os.getenv("DOWNLOADER_SCRIPT", "darkweb-file-downloader.py"))
 
+# Safety
+MAX_MB = int(os.getenv("MAX_MB", "150"))
+ALLOWED_EXT = set(
+    x.strip().lower().lstrip(".")
+    for x in os.getenv("ALLOWED_EXT", "pdf,txt,jpg,jpeg,png,zip").split(",")
+    if x.strip()
+)
 
+# Onion URL validator (v2/v3)
+ONION_RE = re.compile(r"^https?://[a-z2-7]{16,56}\.onion(?:/.*)?$", re.I)
+
+# =======================
+# JOB QUEUE
+# =======================
 @dataclass
 class Job:
     chat_id: int
     url: str
-    mode: str  # "size" | "count" | "download"
-    ext: str | None = None
+    mode: str                 # size | count | download
+    ext: Optional[str] = None
 
 
-job_queue: asyncio.Queue[Job] = asyncio.Queue()
+queue: asyncio.Queue[Job] = asyncio.Queue()
 
 
-def is_valid_onion_url(url: str) -> bool:
+# =======================
+# HELPERS
+# =======================
+def is_onion(url: str) -> bool:
     return bool(ONION_RE.match(url.strip()))
 
+def normalize_ext(ext: str) -> str:
+    e = ext.lower().strip().lstrip(".")
+    if e not in ALLOWED_EXT:
+        raise ValueError(f"❌ Extension ruxsat etilmagan: {e}\n✅ Ruxsat: {', '.join(sorted(ALLOWED_EXT))}")
+    return e
 
-def safe_ext(ext: str) -> str:
-    ext = ext.lower().strip().lstrip(".")
-    if ext not in ALLOWED_EXT:
-        raise ValueError(f"Extension not allowed: {ext}")
-    return ext
+def torsocks_exists() -> bool:
+    return shutil.which("torsocks") is not None
 
+def python_bin() -> str:
+    # Prefer python3 if exists, else python
+    return shutil.which("python3") or shutil.which("python") or "python"
 
-async def run_cmd_and_stream(chat_id: int, bot: Bot, cmd: list[str], workdir: str | None = None) -> tuple[int, str]:
+async def run_subprocess(cmd: list[str], cwd: Optional[str] = None, timeout: int = 600) -> tuple[int, str]:
     """
-    Runs a subprocess and streams some output back to user (throttled).
+    Run subprocess, capture combined output. Timeout in seconds.
     """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        cwd=workdir,
+        cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        stderr=asyncio.subprocess.STDOUT
     )
+    try:
+        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 124, "TIMEOUT"
+    out = (out_bytes or b"").decode(errors="ignore")
+    return proc.returncode, out[-8000:]  # tail
 
-    collected = []
-    last_sent = 0.0
-
-    assert proc.stdout is not None
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        text = line.decode(errors="ignore").rstrip()
-        collected.append(text)
-
-        # throttle updates
-        now = asyncio.get_event_loop().time()
-        if now - last_sent > 2.5:
-            last_sent = now
-            # keep message short
-            snippet = "\n".join(collected[-8:])
-            await bot.send_message(chat_id, f"⏳ Running...\n```\n{snippet}\n```", parse_mode="Markdown")
-
-    code = await proc.wait()
-    out = "\n".join(collected[-200:])  # keep tail
-    return code, out
-
-
-async def scan_with_clamav(file_path: Path) -> str:
+async def fetch_via_tor(url: str, timeout: int = 60) -> tuple[bool, str]:
     """
-    ClamAV scan (blocking external command). Return short summary.
+    Quick connectivity test / simple fetch.
+    Uses TOR_PROXY with socks5h.
     """
-    cmd = ["clamscan", "--no-summary", str(file_path)]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-    )
-    out, _ = await proc.communicate()
-    text = out.decode(errors="ignore").strip()
-    return text or "No output from clamscan"
+    if not ProxyConnector:
+        return False, "aiohttp-socks o'rnatilmagan (pip install aiohttp-socks)"
+
+    connector = ProxyConnector.from_url(TOR_PROXY)
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url, timeout=timeout) as resp:
+                # we don't download the whole thing here; just check it's reachable
+                if resp.status >= 400:
+                    return False, f"HTTP {resp.status}"
+                await resp.content.readexactly(64) if resp.content_length and resp.content_length >= 64 else await resp.content.read(64)
+                return True, "OK"
+    except Exception as e:
+        return False, str(e)
 
 
+# =======================
+# CORE: run downloader
+# =======================
+async def run_downloader(job: Job) -> tuple[bool, str]:
+    """
+    Prefer torsocks + downloader script, else fallback: just test via TOR_PROXY.
+    """
+    if not DOWNLOADER_SCRIPT.exists():
+        return False, f"Downloader skript topilmadi: {DOWNLOADER_SCRIPT}"
+
+    py = python_bin()
+
+    # You must implement/patch your downloader to accept args like:
+    # --mode size|count|download --url ... [--ext pdf] [--out path] [--max-mb N] [--allow-ext csv]
+    # If your downloader is still interactive -> this will not work properly.
+    base_cmd = [py, str(DOWNLOADER_SCRIPT), "--mode", job.mode, "--url", job.url]
+
+    if job.mode == "count" and job.ext:
+        base_cmd += ["--ext", job.ext]
+
+    with tempfile.TemporaryDirectory(prefix="dwbot_") as tmpdir:
+        outdir = Path(tmpdir) / "downloads"
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        if job.mode == "download":
+            base_cmd += [
+                "--out", str(outdir),
+                "--max-mb", str(MAX_MB),
+                "--allow-ext", ",".join(sorted(ALLOWED_EXT)),
+            ]
+
+        # If torsocks exists -> use torsocks (best when tor installed inside container)
+        if torsocks_exists():
+            cmd = ["torsocks"] + base_cmd
+            code, out = await run_subprocess(cmd, timeout=1200)
+            if code == 0:
+                return True, out
+            return False, f"Downloader (torsocks) exit={code}\n{out}"
+
+        # If no torsocks -> fallback: require TOR_PROXY and aiohttp-socks
+        # We can't transparently wrap arbitrary script without torsocks,
+        # so we at least verify that the onion is reachable via TOR_PROXY
+        ok, info = await fetch_via_tor(job.url)
+        if not ok:
+            return False, (
+                "torsocks yo'q va TOR proxy orqali ham ulanib bo'lmadi.\n"
+                f"TOR_PROXY={TOR_PROXY}\n"
+                f"DETAIL: {info}"
+            )
+
+        return False, (
+            "✅ Tor proxy orqali .onion reachable.\n"
+            "❗ Lekin torsocks yo'qligi sabab downloader skriptni ishga tushira olmadim.\n"
+            "Yechim: Dockerfile bilan tor+torsocks o'rnating (tavsiya) yoki downloader'ni to'g'ridan-to'g'ri socks proxy'dan foydalanadigan qilib yozing."
+        )
+
+
+# =======================
+# WORKER LOOP
+# =======================
 async def worker(bot: Bot):
     while True:
-        job = await job_queue.get()
+        job = await queue.get()
         try:
-            await bot.send_message(job.chat_id, f"🧾 Job started: {job.mode}\n{job.url}")
+            await bot.send_message(job.chat_id, f"⏳ Start: `{job.mode}`\n{job.url}", parse_mode="Markdown")
 
-            # Create isolated temp folder per job
-            with tempfile.TemporaryDirectory(prefix="dwbot_") as tmpdir:
-                outdir = Path(tmpdir) / "downloads"
-                outdir.mkdir(parents=True, exist_ok=True)
-
-                # IMPORTANT: This assumes you refactored script to accept args.
-                # Example commands you should implement in the downloader script:
-                cmd = [TORSOCKS_BIN, "python3", str(SCRIPT_PATH), "--mode", job.mode, "--url", job.url]
-
-                if job.mode == "download":
-                    cmd += ["--out", str(outdir), "--max-mb", str(MAX_MB), "--allow-ext", ",".join(sorted(ALLOWED_EXT))]
-                elif job.mode == "count":
-                    if job.ext:
-                        cmd += ["--ext", job.ext]
-
-                code, out = await run_cmd_and_stream(job.chat_id, bot, cmd)
-
-                if code != 0:
-                    await bot.send_message(job.chat_id, f"❌ Failed (exit {code})\n```\n{out}\n```", parse_mode="Markdown")
-                    continue
-
-                # If download mode: scan downloaded files and report
-                if job.mode == "download":
-                    files = list(outdir.rglob("*"))
-                    files = [p for p in files if p.is_file()]
-
-                    if not files:
-                        await bot.send_message(job.chat_id, "ℹ️ Hech narsa yuklanmadi (yoki limit/filtr sabab).")
-                        continue
-
-                    # Scan each file
-                    report_lines = []
-                    for fp in files[:30]:  # avoid huge spam
-                        res = await scan_with_clamav(fp)
-                        report_lines.append(f"{fp.name}: {res}")
-
-                    report = "\n".join(report_lines)
-                    await bot.send_message(job.chat_id, f"🛡️ Scan report (first 30 files):\n```\n{report}\n```", parse_mode="Markdown")
-
-                    # OPTIONAL: send files only if clean + small (Telegram limits apply)
-                    # I recommend NOT auto-sending by default.
-
-                else:
-                    # size/count modes: just show output tail
-                    await bot.send_message(job.chat_id, f"✅ Done\n```\n{out}\n```", parse_mode="Markdown")
-
+            success, output = await run_downloader(job)
+            if success:
+                await bot.send_message(job.chat_id, f"✅ Done\n```\n{output}\n```", parse_mode="Markdown")
+            else:
+                await bot.send_message(job.chat_id, f"⚠️ {output}")
         except Exception as e:
-            await bot.send_message(job.chat_id, f"⚠️ Error: {e}")
+            await bot.send_message(job.chat_id, f"❌ Error: {e}")
         finally:
-            job_queue.task_done()
+            queue.task_done()
+
+
+# =======================
+# BOT
+# =======================
+dp = Dispatcher()
+
+@dp.message(Command("start"))
+async def start_cmd(m: Message):
+    await m.answer(
+        "👋 Darkweb bot.\n\n"
+        "Buyruqlar:\n"
+        "/size <onion_url>\n"
+        "/count <onion_url> [ext]\n"
+        "/download <onion_url>\n\n"
+        f"Limit: {MAX_MB}MB | Ext: {', '.join(sorted(ALLOWED_EXT))}\n"
+        f"Tor proxy: {TOR_PROXY}\n"
+    )
+
+@dp.message(Command("size"))
+async def size_cmd(m: Message):
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not is_onion(parts[1]):
+        return await m.answer("Misol: `/size http://xxxx.onion/path`", parse_mode="Markdown")
+    await queue.put(Job(chat_id=m.chat.id, url=parts[1].strip(), mode="size"))
+    await m.answer("✅ Queuega qo‘shildi.")
+
+@dp.message(Command("count"))
+async def count_cmd(m: Message):
+    parts = (m.text or "").split()
+    if len(parts) < 2 or not is_onion(parts[1]):
+        return await m.answer("Misol: `/count http://xxxx.onion/path pdf`", parse_mode="Markdown")
+    ext = None
+    if len(parts) >= 3:
+        try:
+            ext = normalize_ext(parts[2])
+        except ValueError as e:
+            return await m.answer(str(e))
+    await queue.put(Job(chat_id=m.chat.id, url=parts[1].strip(), mode="count", ext=ext))
+    await m.answer("✅ Queuega qo‘shildi.")
+
+@dp.message(Command("download"))
+async def download_cmd(m: Message):
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not is_onion(parts[1]):
+        return await m.answer("Misol: `/download http://xxxx.onion/path`", parse_mode="Markdown")
+    await queue.put(Job(chat_id=m.chat.id, url=parts[1].strip(), mode="download"))
+    await m.answer("✅ Queuega qo‘shildi.")
+
+@dp.message(F.text)
+async def text_fallback(m: Message):
+    text = (m.text or "").strip()
+    if is_onion(text):
+        # default behavior: treat onion link as /download (or you can choose /size)
+        await queue.put(Job(chat_id=m.chat.id, url=text, mode="download"))
+        return await m.answer("✅ Onion link qabul qilindi. Download queuega qo‘shildi.")
+    await m.answer("Onion link yubor yoki /start bosing.")
 
 
 async def main():
     bot = Bot(BOT_TOKEN)
-    dp = Dispatcher()
-
-    @dp.message(Command("start"))
-    async def start(m: Message):
-        await m.answer(
-            "👋 Darkweb tool bot.\n"
-            "Buyruqlar:\n"
-            "/size <onion_url>\n"
-            "/count <onion_url> [ext]\n"
-            "/download <onion_url>\n"
-            "⚠️ Faqat qonuniy va xavfsiz kontent uchun."
-        )
-
-    @dp.message(Command("size"))
-    async def size(m: Message):
-        parts = (m.text or "").split(maxsplit=1)
-        if len(parts) < 2 or not is_valid_onion_url(parts[1]):
-            return await m.answer("Misol: /size http://xxxx.onion/path")
-        await job_queue.put(Job(chat_id=m.chat.id, url=parts[1].strip(), mode="size"))
-        await m.answer("✅ Queuega qo‘shildi.")
-
-    @dp.message(Command("count"))
-    async def count(m: Message):
-        parts = (m.text or "").split()
-        if len(parts) < 2 or not is_valid_onion_url(parts[1]):
-            return await m.answer("Misol: /count http://xxxx.onion/path pdf")
-        ext = None
-        if len(parts) >= 3:
-            try:
-                ext = safe_ext(parts[2])
-            except ValueError as e:
-                return await m.answer(str(e))
-        await job_queue.put(Job(chat_id=m.chat.id, url=parts[1].strip(), mode="count", ext=ext))
-        await m.answer("✅ Queuega qo‘shildi.")
-
-    @dp.message(Command("download"))
-    async def download(m: Message):
-        parts = (m.text or "").split(maxsplit=1)
-        if len(parts) < 2 or not is_valid_onion_url(parts[1]):
-            return await m.answer("Misol: /download http://xxxx.onion/path")
-        await job_queue.put(Job(chat_id=m.chat.id, url=parts[1].strip(), mode="download"))
-        await m.answer("✅ Queuega qo‘shildi. (Limit + filter ishlaydi)")
-
-    # Start worker(s)
     asyncio.create_task(worker(bot))
     await dp.start_polling(bot)
 
