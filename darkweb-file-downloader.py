@@ -136,7 +136,7 @@ def parse_links(html: str, base_url: str) -> list[str]:
         if should_skip_href(href):
             continue
         out.append(safe_join(base_url, href))
-    # de-dup keep order
+    # de-dup
     seen = set()
     dedup = []
     for u in out:
@@ -161,28 +161,21 @@ def guess_name_from_url(url: str) -> str:
 
 
 def parse_filename_from_content_disposition(cd: str) -> Optional[str]:
-    # very small parser
     if not cd:
         return None
     cd_low = cd.lower()
     if "filename=" not in cd_low:
         return None
-    # take after filename=
     part = cd.split("filename=", 1)[-1].strip()
-    # strip quotes
     if part.startswith('"') and '"' in part[1:]:
         part = part.split('"', 2)[1]
     else:
-        # until semicolon
         part = part.split(";", 1)[0].strip().strip('"').strip("'")
     part = part.strip()
     return part or None
 
 
 async def head_info(session: aiohttp.ClientSession, url: str) -> tuple[Optional[int], str, str]:
-    """
-    return (content_length, content_type, content_disposition)
-    """
     try:
         async with session.head(url, allow_redirects=True) as resp:
             ct = (resp.headers.get("Content-Type") or "").lower()
@@ -196,7 +189,7 @@ async def head_info(session: aiohttp.ClientSession, url: str) -> tuple[Optional[
 
 async def is_probably_html(session: aiohttp.ClientSession, url: str) -> bool:
     _, ct, _ = await head_info(session, url)
-    return "text/html" in ct or "application/xhtml" in ct
+    return ("text/html" in ct) or ("application/xhtml" in ct)
 
 
 async def crawl_directory(session: aiohttp.ClientSession, root_url: str, settings: Settings) -> list[FileItem]:
@@ -234,8 +227,6 @@ async def crawl_directory(session: aiohttp.ClientSession, root_url: str, setting
             u = urlparse(link)
             if u.netloc.lower() != host:
                 continue
-
-            # parent
             if u.path.rstrip("/").endswith(".."):
                 continue
 
@@ -246,9 +237,8 @@ async def crawl_directory(session: aiohttp.ClientSession, root_url: str, setting
 
             name = guess_name_from_url(link)
             ext = norm_ext(name)
-
-            # If no ext, this might be "download?id=.." -> skip for directory mode
             if not ext:
+                # directory mode: ignore "download?id=..."
                 continue
 
             files.append(FileItem(url=link, name=name, ext=ext, path_parts=url_path_parts(link)))
@@ -259,17 +249,14 @@ async def crawl_directory(session: aiohttp.ClientSession, root_url: str, setting
 async def download_direct_file(session: aiohttp.ClientSession, url: str, out_dir: Path, settings: Settings) -> str:
     size, ct, cd = await head_info(session, url)
 
-    # decide filename
     fname = parse_filename_from_content_disposition(cd) or guess_name_from_url(url)
     if not fname:
         fname = "file"
 
     ext = norm_ext(fname)
-    # allow ext filter only if ext exists
     if ext and not is_allowed_ext(ext, settings):
         return f"❌ This file ext not allowed: .{ext}\nAllowed: {', '.join(sorted(settings.allow_ext))}"
 
-    # size limit
     max_bytes = settings.max_mb * 1024 * 1024
     if size is not None and size > max_bytes:
         return f"❌ File too large: {bytes_to_human(size)} (limit {settings.max_mb}MB)"
@@ -305,7 +292,6 @@ async def download_direct_file(session: aiohttp.ClientSession, url: str, out_dir
 
 async def mode_list(root_url: str, settings: Settings, limit: int = 50) -> str:
     async with make_session(settings) as session:
-        # If it's not HTML listing, treat as direct file link
         if not root_url.endswith("/") and not await is_probably_html(session, root_url):
             return f"Direct file link:\n{root_url}"
 
@@ -335,12 +321,11 @@ async def mode_count(root_url: str, ext: Optional[str], settings: Settings) -> s
 
         if ext:
             e = ext.strip().lower().lstrip(".")
-            return f"Count .{e}: {sum(1 for f in allowed if f.ext == e)} (allowed set ichida)"
+            return f"Count .{e}: {sum(1 for f in allowed if f.ext == e)}"
 
         counts: dict[str, int] = {}
         for f in allowed:
-            k = f.ext or "(noext)"
-            counts[k] = counts.get(k, 0) + 1
+            counts[f.ext] = counts.get(f.ext, 0) + 1
 
         parts = [f"Allowed files: {len(allowed)}/{len(files)}"]
         for k in sorted(counts, key=lambda x: (-counts[x], x)):
@@ -353,7 +338,8 @@ async def mode_size(root_url: str, settings: Settings) -> str:
         if not root_url.endswith("/") and not await is_probably_html(session, root_url):
             size, ct, cd = await head_info(session, root_url)
             fname = parse_filename_from_content_disposition(cd) or guess_name_from_url(root_url)
-            return f"Direct file: {fname}\nSize: {bytes_to_human(size or 0) if size else 'unknown'}\nType: {ct or 'unknown'}"
+            s = bytes_to_human(size) if size is not None else "unknown"
+            return f"Direct file: {fname}\nSize: {s}\nType: {ct or 'unknown'}"
 
         files = await crawl_directory(session, root_url, settings)
         allowed = [f for f in files if is_allowed_ext(f.ext, settings)]
@@ -365,32 +351,37 @@ async def mode_download(root_url: str, out_dir: str, settings: Settings) -> str:
     out_root.mkdir(parents=True, exist_ok=True)
 
     async with make_session(settings) as session:
-        # ✅ If direct file link: download it
+        # ✅ direct file
         if not root_url.endswith("/") and not await is_probably_html(session, root_url):
             return await download_direct_file(session, root_url, out_root, settings)
 
-        # Otherwise: directory mode
+        # ✅ directory
         files = await crawl_directory(session, root_url, settings)
         allowed = [f for f in files if is_allowed_ext(f.ext, settings)]
 
-        ok = skip = fail = 0
+        ok = 0
+        skip = 0
+        fail = 0
         logs: list[str] = []
+
         max_bytes = settings.max_mb * 1024 * 1024
 
         for fi in allowed:
             name = fi.name
-            # size gate best effort
+            rel_dir = out_root.joinpath(*fi.path_parts[:-1]) if len(fi.path_parts) > 1 else out_root
+            rel_dir.mkdir(parents=True, exist_ok=True)
+            out_path = rel_dir / name
+
+            # size gate
             size, _, _ = await head_info(session, fi.url)
             if size is not None and size > max_bytes:
                 skip += 1
                 logs.append(f"SKIP too large: {name} ({bytes_to_human(size)})")
                 continue
 
-            rel_dir = out_root.joinpath(*fi.path_parts[:-1]) if len(fi.path_parts) > 1 else out_root
-            rel_dir.mkdir(parents=True, exist_ok=True)
-            out_path = rel_dir / name
-
             downloaded = 0
+            exceeded = False
+
             try:
                 async with session.get(fi.url, allow_redirects=True) as resp:
                     resp.raise_for_status()
@@ -400,18 +391,21 @@ async def mode_download(root_url: str, out_dir: str, settings: Settings) -> str:
                                 continue
                             downloaded += len(chunk)
                             if downloaded > max_bytes:
-                                await f.close()
-                                try:
-                                    out_path.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
-                                skip += 1
-                                logs.append(f"SKIP exceeded limit: {name}")
+                                exceeded = True
                                 break
                             await f.write(chunk)
-                    else:
-                        ok += 1
-                        logs.append(f"OK {name} ({bytes_to_human(downloaded)})")
+
+                if exceeded:
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    skip += 1
+                    logs.append(f"SKIP exceeded limit: {name}")
+                else:
+                    ok += 1
+                    logs.append(f"OK {name} ({bytes_to_human(downloaded)})")
+
             except Exception as e:
                 try:
                     out_path.unlink(missing_ok=True)
